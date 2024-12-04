@@ -38,7 +38,7 @@ DS_PATH = {
     'SUN397': 'sun397',
     'UCF101': 'ucf101',
 }
-import pdb;
+
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
@@ -143,7 +143,7 @@ def prototype_generator(cfg, clip_model):
             image_features = clip_image_encoder(input.type(clip_model.dtype)).to('cpu')
         image_features /= image_features.norm(dim=-1, keepdim=True) # [num_shot, dim]
         for one_label in label.unique():
-            image_features = image_features.to(label.device)
+            image_features = image_features.to(device)
             image_features_one_label = image_features[label == one_label]
             prototype[one_label] = image_features_one_label.mean(dim=0)
         del data
@@ -334,7 +334,12 @@ class CustomCLIP(nn.Module):
 
 @TRAINER_REGISTRY.register()
 class DAPT(TrainerX):
+    from torchcam.methods import GradCAM
+    from torchcam.utils import overlay_mask
+
+    
     def build_model(self):
+        # self.register_hooks()
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
@@ -350,13 +355,33 @@ class DAPT(TrainerX):
         for name, param in self.model.named_parameters():
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
+                
+        """ 여기에 추가하시오"""
+        # Double check
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
+
+        if cfg.MODEL.INIT_WEIGHTS:
+            load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
+        """추가 끝"""
 
         self.model.to(self.device)
         # NOTE: only give prompt_learner to the optimizer
         self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
-
+        
+        """ 여기에 추가하시오"""
+        if 'RPO' in cfg.TRAINER and 'PREC' in cfg.TRAINER.RPO:
+          self.scaler = GradScaler() if cfg.TRAINER.RPO.PREC == "amp" else None
+        else:
+          self.scaler = None
+       
+        """추가 끝"""
+        
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
         if cfg.DATASET.NAME == 'SUN397' or 'ImageNet':
@@ -364,7 +389,12 @@ class DAPT(TrainerX):
             if device_count > 1:
                 print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
                 self.model.text_encoder = nn.DataParallel(self.model.text_encoder)
-
+        
+        """ 여기에 추가하시오"""
+        # nan detector
+        torch.autograd.set_detect_anomaly(True)
+        """추가 끝"""
+        
         if cfg.TRAINER.DAPT.PROTOTYPE_GEN:
             prototype_generator(cfg, clip_model)
         else:
@@ -378,9 +408,9 @@ class DAPT(TrainerX):
         
         output, image_features, text_features = self.model(image)
         loss_orig = F.cross_entropy(output, label)
-
+        # self.visualize_grad_cam(image)
         # visual prompt dispersion loss
-        label = label.to(self.prototype.device)
+        self.prototype = self.prototype.to(self.device)
         batch_p = self.prototype[label]
         p = batch_p
         if self.cfg.USE_CUDA:
@@ -407,6 +437,7 @@ class DAPT(TrainerX):
             self.update_lr()
 
         return loss_summary
+    
 
     def parse_batch_train(self, batch):
         input = batch["img"]
