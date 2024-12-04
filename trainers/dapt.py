@@ -38,7 +38,7 @@ DS_PATH = {
     'SUN397': 'sun397',
     'UCF101': 'ucf101',
 }
-
+import pdb;
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
@@ -143,6 +143,7 @@ def prototype_generator(cfg, clip_model):
             image_features = clip_image_encoder(input.type(clip_model.dtype)).to('cpu')
         image_features /= image_features.norm(dim=-1, keepdim=True) # [num_shot, dim]
         for one_label in label.unique():
+            image_features = image_features.to(label.device)
             image_features_one_label = image_features[label == one_label]
             prototype[one_label] = image_features_one_label.mean(dim=0)
         del data
@@ -379,6 +380,7 @@ class DAPT(TrainerX):
         loss_orig = F.cross_entropy(output, label)
 
         # visual prompt dispersion loss
+        label = label.to(self.prototype.device)
         batch_p = self.prototype[label]
         p = batch_p
         if self.cfg.USE_CUDA:
