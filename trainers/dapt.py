@@ -5,12 +5,17 @@ import pickle
 from operator import mul
 from functools import reduce
 from tqdm import tqdm
-
+import pdb;
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
 from torch.nn import functional as F
 from torch.nn import Dropout
 from torch.nn.modules.utils import _pair
+from torchcam.methods import GradCAM
+
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
@@ -38,6 +43,9 @@ DS_PATH = {
     'SUN397': 'sun397',
     'UCF101': 'ucf101',
 }
+total_losses = []
+image_losses = []
+text_losses = []
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -55,6 +63,66 @@ def load_clip_to_cpu(cfg):
     model = clip.build_model(state_dict or model.state_dict())
 
     return model
+
+def visualize_embeddings(embeddings, labels, title="Embeddings Visualization"):
+    n_samples = len(embeddings)
+    perplexity = min(30, max(5, (n_samples - 1) // 3))
+    
+    tsne = TSNE(n_components=2, random_state=0, perplexity=perplexity)
+    reduced_embeddings = tsne.fit_transform(embeddings)
+    
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x=reduced_embeddings[:, 0], y=reduced_embeddings[:, 1], hue=labels, palette="viridis", legend="full")
+    plt.title(title)
+    plt.xlabel("t-SNE Component 1")
+    plt.ylabel("t-SNE Component 2")
+    plt.tight_layout()  
+    plt.savefig('figure_1.png', dpi=300, bbox_inches='tight')
+
+    pdb.set_trace()
+
+    plt.close()  # 메모리 관리를 위해 plt 닫기
+
+def visualize_grad_cam(model, image, target_layer):
+        cam_extractor = GradCAM(model, target_layer)
+        cams = cam_extractor(image)
+        
+        for img, cam in zip(image, cams):
+            result = overlay_mask(img.permute(1, 2, 0).cpu().numpy(), cam.squeeze(0).cpu().numpy())
+            plt.imshow(result)
+            plt.axis('off')
+            plt.show()
+
+import matplotlib.pyplot as plt
+
+def plot_losses(losses, image_losses, text_losses):
+    epochs = range(1, len(losses) + 1)
+
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs, losses, 'b', label='Total Loss')
+    plt.title('Total Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs, image_losses, 'g', label='Image Loss')
+    plt.title('Image Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs, text_losses, 'r', label='Text Loss')
+    plt.title('Text Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
 
 
 def prototype_generator(cfg, clip_model):
@@ -198,6 +266,7 @@ class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
         self.transformer = clip_model.transformer
+        self.transformer = self.transformer.to(dtype=torch.float32)
         self.positional_embedding = clip_model.positional_embedding
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
@@ -205,12 +274,14 @@ class TextEncoder(nn.Module):
 
     def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
+        x = x.to(dtype=torch.float32)
         x = x.permute(1, 0, 2)  # NLD -> LND
+        
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
+        x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
 
@@ -227,6 +298,8 @@ class PromptLearner(nn.Module):
         dtype = clip_model.dtype
         txt_ctx_dim = clip_model.ln_final.weight.shape[0]
         vis_ctx_dim = clip_model.visual.conv1.weight.shape[0]
+
+
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         patch_size = clip_model.visual.conv1.weight.shape[-1]
@@ -239,14 +312,52 @@ class PromptLearner(nn.Module):
         self.vis_ctx = nn.Parameter(torch.zeros(1, n_vis_ctx, vpt_dim, dtype=dtype)) # [1, n_ctx, dim] = [1, 16, 768]
         nn.init.uniform_(self.vis_ctx.data, -val, val)
     
+        # print("Initializing a generic context")
+        # txt_ctx_vectors = torch.empty(n_txt_ctx, txt_ctx_dim, dtype=dtype)
+        # nn.init.normal_(txt_ctx_vectors, std=0.02)
+        # prompt_prefix = " ".join(["X"] * n_txt_ctx)
+        # self.txt_ctx = nn.Parameter(txt_ctx_vectors)
+
+        # print(f'Initial context: "{prompt_prefix}"')
+
+        device = next(clip_model.parameters()).device
+
+        vis_ctx_base = clip_model.visual.class_embedding
+        vis_ctx_base = vis_ctx_base.repeat(10, n_vis_ctx, 1)  # [1, n_vis_ctx, dim]
+
+        
+        vis_noise = torch.randn(10, n_vis_ctx, vpt_dim, dtype=dtype, device=device)
+        vis_noise = vis_noise / vis_noise.norm(dim=-1, keepdim=True)
+        vis_noise = vis_noise.to('cuda:0')
+        self.vis_ctx = nn.Parameter(vis_ctx_base + 0.1 * vis_noise)
+
+        # random init
         print("Initializing a generic context")
         txt_ctx_vectors = torch.empty(n_txt_ctx, txt_ctx_dim, dtype=dtype)
         nn.init.normal_(txt_ctx_vectors, std=0.02)
         prompt_prefix = " ".join(["X"] * n_txt_ctx)
         self.txt_ctx = nn.Parameter(txt_ctx_vectors)
 
-        print(f'Initial context: "{prompt_prefix}"')
+        # # different ST-init
+        # txt_ctx_base = clip_model.token_embedding(torch.tensor([49407]).cuda())
+        # txt_noise = torch.randn(10, n_txt_ctx, txt_ctx_dim, dtype=dtype, device=device)
+        # txt_noise = txt_noise / txt_noise.norm(dim=-1, keepdim=True)
+        # txt_ctx_result = txt_ctx_base + 0.1 * txt_noise
+        # self.txt_ctx = nn.Parameter(txt_ctx_result)
+        
+        # # same ST-init
+        # txt_noise = torch.randn(1, 1, txt_ctx_dim, dtype=dtype, device=device)
+        # txt_noise = txt_noise / txt_noise.norm(dim=-1, keepdim=True)
+        # txt_ctx_base = clip_model.token_embedding(torch.tensor([49407]).cuda())
+        # txt_ctx_base = txt_ctx_base.repeat(10, n_txt_ctx, 1)
+        # txt_ctx_result = txt_ctx_base + 0.1 * txt_noise
+        # self.txt_ctx = nn.Parameter(txt_ctx_result)
+
+        print("Initializing context from CLIP embeddings")
+        print(f"Visual context shape: {self.vis_ctx.shape}")
+        print(f"Text context shape: {self.txt_ctx.shape}")
         print(f"Number of context words (tokens): {n_txt_ctx}")
+        print(f'Initial context: "{prompt_prefix}"')
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -336,8 +447,6 @@ class CustomCLIP(nn.Module):
 class DAPT(TrainerX):
     from torchcam.methods import GradCAM
     from torchcam.utils import overlay_mask
-
-    
     def build_model(self):
         # self.register_hooks()
         cfg = self.cfg
@@ -356,32 +465,24 @@ class DAPT(TrainerX):
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
                 
-        """ 여기에 추가하시오"""
-        # Double check
-        enabled = set()
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                enabled.add(name)
-        print(f"Parameters to be updated: {enabled}")
-
-        if cfg.MODEL.INIT_WEIGHTS:
-            load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
-        """추가 끝"""
+        # Prompt Learner 가중치 출력
+        print("=== Prompt Learner Weights ===")
+        for name, param in self.model.prompt_learner.named_parameters():
+          print(f"Layer: {name}, Weights: {param}")
+          print(f"  Mean: {param.data.mean().item():.4f}")
+          print(f"  Std: {param.data.std().item():.4f}")
+          print(f"  Min: {param.data.min().item():.4f}")
+          print(f"  Max: {param.data.max().item():.4f}")
+          print("-" * 30)     
+        
+        # pdb.set_trace()
 
         self.model.to(self.device)
         # NOTE: only give prompt_learner to the optimizer
         self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
-        
-        """ 여기에 추가하시오"""
-        if 'RPO' in cfg.TRAINER and 'PREC' in cfg.TRAINER.RPO:
-          self.scaler = GradScaler() if cfg.TRAINER.RPO.PREC == "amp" else None
-        else:
-          self.scaler = None
-       
-        """추가 끝"""
-        
+               
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
         if cfg.DATASET.NAME == 'SUN397' or 'ImageNet':
@@ -389,11 +490,6 @@ class DAPT(TrainerX):
             if device_count > 1:
                 print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
                 self.model.text_encoder = nn.DataParallel(self.model.text_encoder)
-        
-        """ 여기에 추가하시오"""
-        # nan detector
-        torch.autograd.set_detect_anomaly(True)
-        """추가 끝"""
         
         if cfg.TRAINER.DAPT.PROTOTYPE_GEN:
             prototype_generator(cfg, clip_model)
@@ -405,10 +501,13 @@ class DAPT(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        
         output, image_features, text_features = self.model(image)
         loss_orig = F.cross_entropy(output, label)
-        # self.visualize_grad_cam(image)
+        # if self.batch_idx == 0:  
+        visualize_embeddings(image_features.detach().cpu().numpy(), label.detach().cpu().numpy(), title="Image Features")
+        # visualize_embeddings(text_features.detach().cpu().numpy(), label.detach().cpu().numpy(), title="Text Features")
+        # Print all named modules in the model
+
         # visual prompt dispersion loss
         self.prototype = self.prototype.to(self.device)
         batch_p = self.prototype[label]
@@ -424,7 +523,10 @@ class DAPT(TrainerX):
         bi = self.cfg.TRAINER.DAPT.VIS_BETA
         bt = self.cfg.TRAINER.DAPT.TXT_BETA
         loss = loss_orig + bi*loss_dist_i + bt*loss_dist_t
-
+        # print("\n")        
+        # print("original_loss:",loss_orig)
+        # print("image_loss:",loss_dist_i)
+        # print("text_loss:",loss_dist_t, "\n")
         self.model_backward_and_update(loss)
 
         accuracy = compute_accuracy(output, label)[0].item()
@@ -432,10 +534,16 @@ class DAPT(TrainerX):
             "loss": loss.item(),
             "acc": accuracy,
         }
-
+        
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
-
+        loss_orig_cpu = loss_orig.detach().cpu().numpy()
+        loss_dist_i_cpu = loss_dist_i.detach().cpu().numpy()
+        loss_dist_t_cpu = loss_dist_t.detach().cpu().numpy()
+        total_losses.append(loss_orig_cpu.item())
+        image_losses.append(loss_dist_i_cpu.item())
+        text_losses.append(loss_dist_t_cpu.item())
+       
         return loss_summary
     
 
@@ -479,3 +587,9 @@ class DAPT(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+    
+
+    
+
+
+
